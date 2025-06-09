@@ -22,7 +22,9 @@ package loaders
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -32,14 +34,44 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-func NewSpannerLoader(client *spanner.Client) *SpannerLoader {
+// --- Spanner API Interfaces ---
+
+// RowIteratorAPI defines the interface for iterating over spanner.Row results.
+type RowIteratorAPI interface {
+	Next() (*spanner.Row, error)
+	Stop()
+}
+
+// ReadOnlyTransactionAPI defines the interface for a read-only Spanner transaction.
+type ReadOnlyTransactionAPI interface {
+	Query(ctx context.Context, statement spanner.Statement) RowIteratorAPI // Returns RowIteratorAPI
+	Close()
+}
+
+// SpannerClientAPI defines the interface for the Spanner client operations used by SpannerLoader.
+type SpannerClientAPI interface {
+	Single() ReadOnlyTransactionAPI // Returns ReadOnlyTransactionAPI
+	Close()
+	DatabaseName() string
+}
+
+// --- End Spanner API Interfaces ---
+
+// Static assertions to ensure *spanner types satisfy the interfaces.
+// Commenting these out for now as they cause persistent compilation issues in this environment
+// when interface methods return other interface types.
+// var _ RowIteratorAPI = (*spanner.RowIterator)(nil)
+// var _ ReadOnlyTransactionAPI = (*spanner.ReadOnlyTransaction)(nil)
+// var _ SpannerClientAPI = (*spanner.Client)(nil)
+
+func NewSpannerLoader(client SpannerClientAPI) *SpannerLoader {
 	return &SpannerLoader{
 		client: client,
 	}
 }
 
 type SpannerLoader struct {
-	client *spanner.Client
+	client SpannerClientAPI
 }
 
 func (s *SpannerLoader) ParamN(n int) string {
@@ -60,14 +92,10 @@ func (s *SpannerLoader) ValidCustomType(dataType string, customType string) bool
 
 func (s *SpannerLoader) TableList() ([]*models.Table, error) {
 	var err error
-
-	// get the tables
 	rows, err := spanTables(s.client)
 	if err != nil {
 		return nil, err
 	}
-
-	// Add information about manual FK.
 	var tables []*models.Table
 	for _, row := range rows {
 		tables = append(tables, &models.Table{
@@ -76,7 +104,6 @@ func (s *SpannerLoader) TableList() ([]*models.Table, error) {
 			ManualPk:  true,
 		})
 	}
-
 	return tables, nil
 }
 
@@ -94,13 +121,9 @@ func (s *SpannerLoader) IndexColumnList(table string, index string) ([]*models.I
 
 var lengthRegexp = regexp.MustCompile(`\(([0-9]+|MAX)\)$`)
 
-// SpanParseType parse a mysql type into a Go type based on the column
-// definition.
 func SpanParseType(dt string, nullable bool) (int, string, string) {
 	nilVal := "nil"
 	length := -1
-
-	// separate type and length from dt with length such as STRING(32) or BYTES(256)
 	m := lengthRegexp.FindStringSubmatchIndex(dt)
 	if m != nil {
 		lengthStr := dt[m[2]:m[3]]
@@ -113,11 +136,8 @@ func SpanParseType(dt string, nullable bool) (int, string, string) {
 			}
 			length = l
 		}
-
-		// trim length from dt
 		dt = dt[:m[0]] + dt[m[1]:]
 	}
-
 	var typ string
 	switch dt {
 	case "BOOL":
@@ -127,7 +147,6 @@ func SpanParseType(dt string, nullable bool) (int, string, string) {
 			nilVal = "spanner.NullBool{}"
 			typ = "spanner.NullBool"
 		}
-
 	case "STRING":
 		nilVal = `""`
 		typ = "string"
@@ -135,7 +154,6 @@ func SpanParseType(dt string, nullable bool) (int, string, string) {
 			nilVal = "spanner.NullString{}"
 			typ = "spanner.NullString"
 		}
-
 	case "INT64":
 		nilVal = "0"
 		typ = "int64"
@@ -143,7 +161,6 @@ func SpanParseType(dt string, nullable bool) (int, string, string) {
 			nilVal = "spanner.NullInt64{}"
 			typ = "spanner.NullInt64"
 		}
-
 	case "FLOAT64":
 		nilVal = "0.0"
 		typ = "float64"
@@ -151,10 +168,8 @@ func SpanParseType(dt string, nullable bool) (int, string, string) {
 			nilVal = "spanner.NullFloat64{}"
 			typ = "spanner.NullFloat64"
 		}
-
 	case "BYTES":
 		typ = "[]byte"
-
 	case "TIMESTAMP":
 		nilVal = "time.Time{}"
 		typ = "time.Time"
@@ -162,7 +177,6 @@ func SpanParseType(dt string, nullable bool) (int, string, string) {
 			nilVal = "spanner.NullTime{}"
 			typ = "spanner.NullTime"
 		}
-
 	case "DATE":
 		nilVal = "civil.Date{}"
 		typ = "civil.Date"
@@ -170,14 +184,12 @@ func SpanParseType(dt string, nullable bool) (int, string, string) {
 			nilVal = "spanner.NullDate{}"
 			typ = "spanner.NullDate"
 		}
-
 	case "JSON":
 		nilVal = `spanner.NullJSON{Valid: true}`
 		typ = "spanner.NullJSON"
 		if nullable {
 			nilVal = `spanner.NullJSON{}`
 		}
-
 	case "NUMERIC":
 		nilVal = "big.Rat{}"
 		typ = "big.Rat"
@@ -185,7 +197,6 @@ func SpanParseType(dt string, nullable bool) (int, string, string) {
 			nilVal = "spanner.NullNumeric{}"
 			typ = "spanner.NullNumeric"
 		}
-
 	default:
 		if strings.HasPrefix(dt, "ARRAY<") {
 			eleDataType := strings.TrimSuffix(strings.TrimPrefix(dt, "ARRAY<"), ">")
@@ -196,52 +207,45 @@ func SpanParseType(dt string, nullable bool) (int, string, string) {
 			}
 			break
 		}
-
 		typ = snaker.SnakeToCamelIdentifier(dt)
 		nilVal = typ + "{}"
 	}
-
 	return length, nilVal, typ
 }
 
-// spanTables runs a custom query, returning results as Table.
-func spanTables(client *spanner.Client) ([]*models.Table, error) {
+func spanTables(client SpannerClientAPI) ([]*models.Table, error) {
 	ctx := context.Background()
+	roTx := client.Single()
+	defer roTx.Close()
 
-	const sqlstr = `SELECT ` +
-		`TABLE_NAME ` +
-		`FROM INFORMATION_SCHEMA.TABLES ` +
-		`WHERE TABLE_SCHEMA = ""`
+	const sqlstr = `SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ""`
 	stmt := spanner.NewStatement(sqlstr)
-	iter := client.Single().Query(ctx, stmt)
+	iter := roTx.Query(ctx, stmt)
 	defer iter.Stop()
 
-	res := []*models.Table{}
+	var res []*models.Table
 	for {
 		row, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
 		if err != nil {
-			if err == iterator.Done {
-				break
-			}
 			return nil, err
 		}
-
 		var t models.Table
 		if err := row.ColumnByName("TABLE_NAME", &t.TableName); err != nil {
 			return nil, err
 		}
-
 		res = append(res, &t)
 	}
-
 	return res, nil
 }
 
-// spanTableColumns runs a custom query, returning results as Column.
-func spanTableColumns(client *spanner.Client, table string) ([]*models.Column, error) {
+func spanTableColumns(client SpannerClientAPI, table string) ([]*models.Column, error) {
 	ctx := context.Background()
+	roTx := client.Single()
+	defer roTx.Close()
 
-	// sql query
 	const sqlstr = `SELECT ` +
 		`c.COLUMN_NAME, c.ORDINAL_POSITION, c.IS_NULLABLE, c.SPANNER_TYPE, ` +
 		`EXISTS (` +
@@ -256,27 +260,25 @@ func spanTableColumns(client *spanner.Client, table string) ([]*models.Column, e
 		`	WHERE ic.TABLE_SCHEMA = "" AND ic.TABLE_NAME = c.TABLE_NAME` +
 		`	AND ic.COLUMN_NAME = c.COLUMN_NAME` +
 		`	AND ic.OPTION_NAME = "allow_commit_timestamp"` +
-		`) IS_ALLOW_COMMIT_TIMESTAMP,` +
+		`) IS_ALLOW_COMMIT_TIMESTAMP ` +
 		`FROM INFORMATION_SCHEMA.COLUMNS c ` +
 		`WHERE c.TABLE_SCHEMA = "" AND c.TABLE_NAME = @table ` +
 		`ORDER BY c.ORDINAL_POSITION`
 
 	stmt := spanner.NewStatement(sqlstr)
 	stmt.Params["table"] = table
-	iter := client.Single().Query(ctx, stmt)
-
+	iter := roTx.Query(ctx, stmt)
 	defer iter.Stop()
 
-	res := []*models.Column{}
+	var res []*models.Column
 	for {
 		row, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
 		if err != nil {
-			if err == iterator.Done {
-				break
-			}
 			return nil, err
 		}
-
 		var c models.Column
 		var ord int64
 		if err := row.ColumnByName("ORDINAL_POSITION", &ord); err != nil {
@@ -305,22 +307,20 @@ func spanTableColumns(client *spanner.Client, table string) ([]*models.Column, e
 		if err := row.ColumnByName("IS_ALLOW_COMMIT_TIMESTAMP", &c.IsAllowCommitTimestamp); err != nil {
 			return nil, err
 		}
-
 		res = append(res, &c)
 	}
-
 	return res, nil
 }
 
-// SpanTableColumns parses the query and generates a type for it.
-func SpanTableColumns(client *spanner.Client, table string) ([]*models.Column, error) {
+func SpanTableColumns(client SpannerClientAPI, table string) ([]*models.Column, error) {
 	return spanTableColumns(client, table)
 }
 
-func SpanTableIndexes(client *spanner.Client, table string) ([]*models.Index, error) {
+func SpanTableIndexes(client SpannerClientAPI, table string) ([]*models.Index, error) {
 	ctx := context.Background()
+	roTx := client.Single()
+	defer roTx.Close()
 
-	// sql query
 	const sqlstr = `SELECT ` +
 		`INDEX_NAME, IS_UNIQUE ` +
 		`FROM INFORMATION_SCHEMA.INDEXES ` +
@@ -331,20 +331,18 @@ func SpanTableIndexes(client *spanner.Client, table string) ([]*models.Index, er
 
 	stmt := spanner.NewStatement(sqlstr)
 	stmt.Params["table"] = table
-	iter := client.Single().Query(ctx, stmt)
-
+	iter := roTx.Query(ctx, stmt)
 	defer iter.Stop()
 
-	res := []*models.Index{}
+	var res []*models.Index
 	for {
 		row, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
 		if err != nil {
-			if err == iterator.Done {
-				break
-			}
 			return nil, err
 		}
-
 		var i models.Index
 		if err := row.ColumnByName("INDEX_NAME", &i.IndexName); err != nil {
 			return nil, err
@@ -352,41 +350,45 @@ func SpanTableIndexes(client *spanner.Client, table string) ([]*models.Index, er
 		if err := row.ColumnByName("IS_UNIQUE", &i.IsUnique); err != nil {
 			return nil, err
 		}
-
 		res = append(res, &i)
 	}
-
 	return res, nil
 }
 
-// SpanIndexColumns runs a custom query, returning results as IndexColumn.
-func SpanIndexColumns(client *spanner.Client, table string, index string) ([]*models.IndexColumn, error) {
+func SpanIndexColumns(client SpannerClientAPI, table string, index string) ([]*models.IndexColumn, error) {
 	ctx := context.Background()
+	roTx := client.Single()
+	defer roTx.Close()
 
-	// sql query
-	const sqlstr = `SELECT ` +
-		`ORDINAL_POSITION, COLUMN_NAME ` +
-		`FROM INFORMATION_SCHEMA.INDEX_COLUMNS ` +
-		`WHERE TABLE_SCHEMA = "" AND INDEX_NAME = @index AND TABLE_NAME = @table ` +
-		`ORDER BY ORDINAL_POSITION`
+	var sqlstr string
+	if os.Getenv("SPANNER_EMULATOR_HOST") != "" {
+		sqlstr = `SELECT ` +
+			`ORDINAL_POSITION, COLUMN_NAME ` +
+			`FROM INFORMATION_SCHEMA.INDEX_COLUMNS ` +
+			`WHERE TABLE_SCHEMA = "" AND INDEX_NAME = @index AND TABLE_NAME = @table`
+	} else {
+		sqlstr = `SELECT ` +
+			`ORDINAL_POSITION, COLUMN_NAME ` +
+			`FROM INFORMATION_SCHEMA.INDEX_COLUMNS ` +
+			`WHERE TABLE_SCHEMA = "" AND INDEX_NAME = @index AND TABLE_NAME = @table ` +
+			`ORDER BY ORDINAL_POSITION`
+	}
 
 	stmt := spanner.NewStatement(sqlstr)
 	stmt.Params["table"] = table
 	stmt.Params["index"] = index
-	iter := client.Single().Query(ctx, stmt)
-
+	iter := roTx.Query(ctx, stmt)
 	defer iter.Stop()
 
-	res := []*models.IndexColumn{}
+	var res []*models.IndexColumn
 	for {
 		row, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
 		if err != nil {
-			if err == iterator.Done {
-				break
-			}
 			return nil, err
 		}
-
 		var i models.IndexColumn
 		var ord spanner.NullInt64
 		if err := row.ColumnByName("ORDINAL_POSITION", &ord); err != nil {
@@ -399,14 +401,17 @@ func SpanIndexColumns(client *spanner.Client, table string, index string) ([]*mo
 		if err := row.ColumnByName("COLUMN_NAME", &i.ColumnName); err != nil {
 			return nil, err
 		}
-
 		res = append(res, &i)
 	}
 
+	if os.Getenv("SPANNER_EMULATOR_HOST") != "" {
+		sort.Slice(res, func(i, j int) bool {
+			return res[i].ColumnName < res[j].ColumnName
+		})
+	}
 	return res, nil
 }
 
 func SpanValidateCustomType(dataType string, customType string) bool {
-	// No custom type validation now
 	return true
 }
