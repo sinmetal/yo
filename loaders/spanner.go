@@ -21,6 +21,7 @@ package loaders
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -221,10 +222,10 @@ func spanTables(client *spanner.Client) ([]*models.Table, error) {
 	res := []*models.Table{}
 	for {
 		row, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
 		if err != nil {
-			if err == iterator.Done {
-				break
-			}
 			return nil, err
 		}
 
@@ -272,10 +273,10 @@ func spanTableColumns(client *spanner.Client, table string) ([]*models.Column, e
 	res := []*models.Column{}
 	for {
 		row, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
 		if err != nil {
-			if err == iterator.Done {
-				break
-			}
 			return nil, err
 		}
 
@@ -340,10 +341,10 @@ func SpanTableIndexes(client *spanner.Client, table string) ([]*models.Index, er
 	res := []*models.Index{}
 	for {
 		row, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
 		if err != nil {
-			if err == iterator.Done {
-				break
-			}
 			return nil, err
 		}
 
@@ -383,10 +384,10 @@ func SpanIndexColumns(client *spanner.Client, table string, index string) ([]*mo
 	res := []*models.IndexColumn{}
 	for {
 		row, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
 		if err != nil {
-			if err == iterator.Done {
-				break
-			}
 			return nil, err
 		}
 
